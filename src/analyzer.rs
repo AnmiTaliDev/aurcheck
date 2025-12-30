@@ -1,22 +1,22 @@
 use crate::aur::{AurPackage, AurClient};
 use crate::pkgbuild::PkgBuild;
-use crate::security::{SecurityReport, SecurityRules, SecurityIssue, SecurityLevel};
+use crate::security::{SecurityReport, SecurityIssue, SecurityLevel};
+use crate::heuristics::HeuristicAnalyzer;
 use crate::errors::Result;
 use url::Url;
 
 pub struct SecurityAnalyzer {
-    rules: SecurityRules,
+    heuristic_analyzer: HeuristicAnalyzer,
     aur_client: AurClient,
 }
 
 impl SecurityAnalyzer {
     pub fn new(_config_file: Option<&String>) -> Result<Self> {
-        let rules = SecurityRules::new()
-            .map_err(|e| crate::errors::AurCheckError::Security(e.to_string()))?;
+        let heuristic_analyzer = HeuristicAnalyzer::new();
         let aur_client = AurClient::new()?;
 
         Ok(Self {
-            rules,
+            heuristic_analyzer,
             aur_client,
         })
     }
@@ -26,17 +26,18 @@ impl SecurityAnalyzer {
 
         let pkgbuild = PkgBuild::parse(pkgbuild_content)?;
 
-        issues.extend(self.check_pkgbuild_content(&pkgbuild).await?);
+        // Use heuristic analysis for PKGBUILD content
+        let findings = self.heuristic_analyzer.analyze_pkgbuild(&pkgbuild);
+        let heuristic_issues = self.heuristic_analyzer.findings_to_issues(&findings);
+        issues.extend(heuristic_issues);
+
+        // Keep URL/source validation
         issues.extend(self.check_sources(&pkgbuild).await?);
-        issues.extend(self.check_build_functions(&pkgbuild)?);
+
+        // Keep metadata checks
         issues.extend(self.check_package_metadata(package)?);
 
         Ok(SecurityReport::new(package.name.clone(), issues))
-    }
-
-    async fn check_pkgbuild_content(&self, pkgbuild: &PkgBuild) -> Result<Vec<SecurityIssue>> {
-        let issues = self.rules.check_content(&pkgbuild.content, "PKGBUILD");
-        Ok(issues)
     }
 
     async fn check_sources(&self, pkgbuild: &PkgBuild) -> Result<Vec<SecurityIssue>> {
@@ -76,7 +77,6 @@ impl SecurityAnalyzer {
             });
         }
 
-        // Safe host extraction with proper error handling
         if let Some(host) = url.host_str() {
             if self.is_suspicious_domain(host) {
                 issues.push(SecurityIssue {
@@ -102,7 +102,6 @@ impl SecurityAnalyzer {
                 });
             }
 
-            // Check for dark web domains
             if self.is_dark_web_domain(host) {
                 issues.push(SecurityIssue {
                     level: SecurityLevel::Critical,
@@ -115,7 +114,6 @@ impl SecurityAnalyzer {
                 });
             }
 
-            // Check for potentially compromised domains
             if self.is_potentially_compromised_domain(host) {
                 issues.push(SecurityIssue {
                     level: SecurityLevel::Warning,
@@ -158,17 +156,16 @@ impl SecurityAnalyzer {
 
     fn get_suspicious_domains() -> &'static [&'static str] {
         &[
-            // URL shorteners (subset of concern)
             "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly",
             "short.link", "tiny.cc", "rb.gy", "cutt.ly",
-            // Suspicious file hosting
             "anonfiles.com", "gofile.io", "temp.sh", "file.io",
             "sendspace.com", "zippyshare.com", "mediafire.com",
-            // Compromised/malicious domains (examples)
-            "pastebin.com", "hastebin.com", "paste.ee",
-            // Suspicious TLDs
-            ".tk", ".ml", ".ga", ".cf"
+            "pastebin.com", "hastebin.com", "paste.ee"
         ]
+    }
+
+    fn get_suspicious_tlds() -> &'static [&'static str] {
+        &[".tk", ".ml", ".ga", ".cf", ".gq"]
     }
 
     fn get_dark_web_domains() -> &'static [&'static str] {
@@ -183,9 +180,17 @@ impl SecurityAnalyzer {
     }
 
     fn is_suspicious_domain(&self, domain: &str) -> bool {
-        Self::get_suspicious_domains().iter().any(|&d| {
-            domain.contains(d) || domain.ends_with(d)
-        })
+        // Check exact domain matches or subdomains
+        let is_suspicious = Self::get_suspicious_domains().iter().any(|&d| {
+            domain == d || domain.ends_with(&format!(".{}", d))
+        });
+
+        // Check suspicious TLDs (must be at the end)
+        let has_suspicious_tld = Self::get_suspicious_tlds().iter().any(|&tld| {
+            domain.ends_with(tld)
+        });
+
+        is_suspicious || has_suspicious_tld
     }
 
     fn is_url_shortener(&self, domain: &str) -> bool {
@@ -238,17 +243,6 @@ impl SecurityAnalyzer {
         Ok(issues)
     }
 
-    fn check_build_functions(&self, pkgbuild: &PkgBuild) -> Result<Vec<SecurityIssue>> {
-        let mut issues = Vec::new();
-
-        for (func_name, func_body) in &pkgbuild.functions {
-            let func_issues = self.rules.check_content(func_body, &format!("{}() function", func_name));
-            issues.extend(func_issues);
-        }
-
-        Ok(issues)
-    }
-
     fn check_package_metadata(&self, package: &AurPackage) -> Result<Vec<SecurityIssue>> {
         let mut issues = Vec::new();
 
@@ -286,9 +280,8 @@ impl SecurityAnalyzer {
 
     async fn validate_tls_certificate(&self, url: &Url) -> Result<Vec<SecurityIssue>> {
         let mut issues = Vec::new();
-        
+
         if let Some(host) = url.host_str() {
-            // Simple certificate validation by attempting connection
             let test_url = format!("https://{}", host);
             match self.aur_client.test_tls_connection(&test_url).await {
                 Ok(false) => {
@@ -313,10 +306,10 @@ impl SecurityAnalyzer {
                         context: Some(url.to_string()),
                     });
                 }
-                Ok(true) => {} // Certificate is valid
+                Ok(true) => {}
             }
         }
-        
+
         Ok(issues)
     }
 }

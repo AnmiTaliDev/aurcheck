@@ -6,6 +6,7 @@ mod aur;
 mod analyzer;
 mod pkgbuild;
 mod security;
+mod heuristics;
 mod output;
 mod errors;
 
